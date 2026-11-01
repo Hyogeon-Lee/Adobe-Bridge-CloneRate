@@ -64,8 +64,10 @@
     };
 
     function run() {
-        var srcDir = Folder.selectDialog("1/2  Select the SOURCE folder (ratings are read from here)");
-        if (!srcDir) return;
+        var folders = pickFolders();
+        if (!folders) return;
+        var srcDir = folders.src;
+        var dstDir = folders.dst;
         var srcExts = extensionsIn(srcDir, null);
         if (srcExts.length === 0) {
             alert("No files in the source folder.\n\n" + srcDir.fsName, TITLE, true);
@@ -74,8 +76,6 @@
         var srcExt = pickExtension("Source: which files carry the ratings?", srcDir, srcExts, false);
         if (!srcExt) return;
 
-        var dstDir = Folder.selectDialog("2/2  Select the TARGET folder (ratings are written here)");
-        if (!dstDir) return;
         var sameFolder = srcDir.fsName.toLowerCase() === dstDir.fsName.toLowerCase();
         // In one folder the source extension cannot also be the target
         var dstExts = extensionsIn(dstDir, sameFolder ? srcExt : null);
@@ -105,6 +105,81 @@
         if (ui.progressFile) ui.log("Progress is also written to " + ui.progressFile.fsName);
         ui.flush();
         ui.show();
+    }
+
+    // Source and target folders as typed or pasted paths, with Browse as an alternative. Returns {src, dst} or null.
+    // Browse closes the dialog and reopens it afterwards: Bridge 2026 did not show confirm() from inside a dialog,
+    // so no native dialog is opened from one.
+    function pickFolders() {
+        var src = "", dst = "", error = "";
+        for (;;) {
+            var r = folderDialog(src, dst, error);
+            src = r.src;
+            dst = r.dst;
+            error = "";
+            if (r.action === "cancel") return null;
+            if (r.action === "browseSrc") {
+                src = browse(src, "Select the SOURCE folder (ratings are read from here)");
+            } else if (r.action === "browseDst") {
+                dst = browse(dst, "Select the TARGET folder (ratings are written here)");
+            } else {
+                var s = folderFrom(src), d = folderFrom(dst);
+                if (s && d) return { src: s, dst: d };
+                error = !s ? "Source folder not found: " + (src || "(empty)") : "Target folder not found: " + (dst || "(empty)");
+            }
+        }
+    }
+
+    // Returns {action: "ok" | "cancel" | "browseSrc" | "browseDst", src, dst} with the field texts
+    function folderDialog(src, dst, error) {
+        var w = new Window("dialog", TITLE);
+        w.orientation = "column";
+        w.alignChildren = ["fill", "top"];
+        var result = { action: "cancel", src: src, dst: dst };
+        var fields = {};
+        function done(action) {
+            result = { action: action, src: fields.src.text, dst: fields.dst.text };
+            w.close();
+        }
+        function row(key, label, text) {
+            w.add("statictext", undefined, label);
+            var g = w.add("group");
+            fields[key] = g.add("edittext", undefined, text);
+            fields[key].characters = 70;
+            g.add("button", undefined, "Browse...").onClick = function () {
+                done(key === "src" ? "browseSrc" : "browseDst");
+            };
+        }
+        row("src", "Source folder (ratings are read from here)", src);
+        row("dst", "Target folder (ratings are written here)", dst);
+        w.add("statictext", undefined, "Paste a path from the Explorer address bar or \"Copy as path\", or press Browse.");
+        if (error) w.add("statictext", undefined, error);
+
+        var group = w.add("group");
+        group.alignment = "right";
+        group.add("button", undefined, "Cancel", { name: "cancel" }).onClick = function () { w.close(); };
+        // Named "ok" so Enter in a path field confirms
+        group.add("button", undefined, "OK", { name: "ok" }).onClick = function () { done("ok"); };
+        (src && !dst ? fields.dst : fields.src).active = true;
+        w.show();
+        return result;
+    }
+
+    function browse(text, prompt) {
+        var start = folderFrom(text);
+        var f = start ? start.selectDlg(prompt) : Folder.selectDialog(prompt);
+        return f ? f.fsName : text;
+    }
+
+    // Existing folder for a typed or pasted path, else null. Drops surrounding spaces and the quotes that Explorer's
+    // "Copy as path" adds, and trailing separators except after a drive ("C:\"), so the same-folder check sees
+    // "...\jpg\" and "...\jpg" as one folder.
+    function folderFrom(text) {
+        var p = text.replace(/^\s+|\s+$/g, "").replace(/^"(.*)"$/, "$1").replace(/([^:\\\/])[\\\/]+$/, "$1");
+        if (p === "") return null;
+        // Called without new, Folder returns a File when the path is an existing file
+        var f = Folder(p);
+        return f instanceof Folder && f.exists ? f : null;
     }
 
     // Distinct lowercase extensions in a folder with file counts, most frequent first
