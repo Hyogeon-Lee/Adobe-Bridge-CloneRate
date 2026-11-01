@@ -7,14 +7,26 @@
     var TITLE = "Clone Rating";
 
     var CONFIG = {
-        // Off: an unrated source file never clears an existing target rating
-        WRITE_ZERO: false,
+        // On: an unrated source file clears the target rating, so removing a star in the source carries over
+        WRITE_ZERO: true,
         SYNC_REJECT: false,
         BACKUP_XMP: true,
+        // Copies a target whose XMP is embedded (JPG, TIFF, DNG) before Bridge rewrites it; kept only if the file changed
+        BACKUP_EMBEDDED: true,
         FAST_READ: true,
         FAST_READ_CHECK: 100,
         PROGRESS_FILE: true
     };
+
+    // Proprietary RAW formats keep Bridge metadata in a .xmp sidecar, so the file itself must never change.
+    // DNG is not listed: Bridge writes its XMP inside the file.
+    var RAW_EXTS = {
+        ".3fr": 1, ".arw": 1, ".cr2": 1, ".cr3": 1, ".crw": 1, ".dcr": 1, ".erf": 1, ".fff": 1, ".iiq": 1,
+        ".kdc": 1, ".mef": 1, ".mos": 1, ".mrw": 1, ".nef": 1, ".nrw": 1, ".orf": 1, ".pef": 1, ".raf": 1,
+        ".raw": 1, ".rw2": 1, ".rwl": 1, ".sr2": 1, ".srf": 1, ".srw": 1, ".x3f": 1
+    };
+
+    var COLORS = { accent: [0.25, 0.55, 1], ok: [0.2, 0.65, 0.3], warn: [0.95, 0.55, 0.1], bad: [0.9, 0.25, 0.2], dim: [0.55, 0.55, 0.55] };
 
     // Load log in the temp folder: Bridge shows nothing when a startup script fails while loading
     var loadLog = new File(Folder.temp.fsName + "/Clone-Rating.load.log");
@@ -88,6 +100,7 @@
         if (sameFolder) ui.log("Source and target are the same folder: source ratings are read through Bridge.");
         ui.log("");
         ui.log("Files are paired by name without extension. Press Start to read ratings.");
+        ui.log("Nothing is written until you review the plan and press Write.");
         ui.log("Bridge may stop responding while reading; this window updates as it goes.");
         if (ui.progressFile) ui.log("Progress is also written to " + ui.progressFile.fsName);
         ui.flush();
@@ -148,21 +161,32 @@
         return choice;
     }
 
-    // One window for the whole run: log, status line, progress bar, one action button whose label changes per stage
+    // One window for the whole run: step bar, status, progress bar, summary numbers, log, and one action button
+    // whose label changes per stage
     function makeUi(ctx) {
         var ui = {};
         var w = new Window("dialog", TITLE);
         w.orientation = "column";
         w.alignChildren = ["fill", "top"];
 
+        var setStep = makeSteps(w);
         var status = w.add("statictext", undefined, "Ready.");
+        style(status, true, null);
+        // A space, not "", so ScriptUI lays the line out with a text height
+        var detail = w.add("statictext", undefined, " ");
         var bar = w.add("progressbar", undefined, 0, 1);
         bar.preferredSize = [720, 12];
+        var cells = makeSummary(w);
         var box = w.add("edittext", undefined, "", { multiline: true, readonly: true, scrolling: true });
-        box.preferredSize = [720, 360];
+        box.preferredSize = [720, 300];
 
         var group = w.add("group");
-        group.alignment = "right";
+        var after = group.add("group");
+        after.alignment = ["fill", "center"];
+        var openLog = after.add("button", undefined, "Open log");
+        var openBackup = after.add("button", undefined, "Open backup");
+        var showTarget = after.add("button", undefined, "Show target in Bridge");
+        after.visible = false;
         var cancel = group.add("button", undefined, "Cancel");
         var action = group.add("button", undefined, "Start reading");
 
@@ -171,6 +195,9 @@
         var lastFlush = 0;
         var stage = "read";
         var plan = null;
+        var result = null;
+        var phaseName = "";
+        var phaseStart = 0;
 
         ui.progressFile = CONFIG.PROGRESS_FILE ? new File(ctx.dstDir.fsName + "/_rating_sync_progress.txt") : null;
         var fileProgress = ui.progressFile ? makeProgress(ui.progressFile, ctx) : function () {};
@@ -187,21 +214,40 @@
             w.update();
         };
         ui.progress = function (phase, done, total, current) {
-            fileProgress(phase, done, total, current);
-            status.text = phase + (total ? "  " + done + " / " + total : "") + (current ? "   " + current : "");
+            var now = new Date().getTime();
+            if (phase !== phaseName) {
+                phaseName = phase;
+                phaseStart = now;
+            }
+            var speed = speedText(done, total, now - phaseStart);
+            fileProgress(phase, done, total, current, speed);
+            status.text = phase + (total ? "    " + done + " / " + total + "  (" + Math.floor(done * 100 / total) + "%)" : "");
+            detail.text = speed + (speed && current ? "    " : "") + (current || "");
             bar.maxvalue = total || 1;
             bar.value = total ? done : 0;
-            var now = new Date().getTime();
             if (dirty && (now - lastFlush > 1000 || done === total)) ui.flush();
             else w.update();
         };
+        // Counts only grow during a run, so a highlighted value never needs its color reset
+        ui.cell = function (key, value, level, label) {
+            cells[key].value.text = String(value);
+            if (label) cells[key].label.text = label;
+            if (level) style(cells[key].value, null, COLORS[level]);
+        };
         ui.show = function () { w.show(); };
 
-        function finish(label) {
+        // r: {text, level: "ok" | "warn" | "bad", logFile?, backupDir?}
+        function finish(r) {
+            result = r;
             stage = "done";
+            setStep(4);
             action.text = "Close";
             cancel.visible = false;
-            ui.progress(label, 0, 0, "");
+            ui.progress(r.text, 0, 0, "");
+            style(status, null, COLORS[r.level]);
+            openLog.visible = !!r.logFile;
+            openBackup.visible = !!r.backupDir;
+            after.visible = true;
             ui.flush();
         }
 
@@ -215,23 +261,36 @@
                 if (stage === "read") {
                     plan = readPhase(ctx, ui);
                     if (plan.list.length === 0) {
-                        finish("Finished: nothing to write. No files were changed.");
+                        finish({ text: "Finished: nothing to write. No files were changed.", level: plan.warnings ? "warn" : "ok" });
                     } else {
                         stage = "write";
+                        setStep(2);
                         action.text = "Write " + plan.list.length + " file" + (plan.list.length === 1 ? "" : "s");
                         action.enabled = true;
                         cancel.enabled = true;
-                        ui.progress("Waiting: press Write to apply, or Cancel.", 0, 0, "");
+                        ui.progress("Review: check the summary and planned changes, then press Write or Cancel.", 0, 0, "");
                         ui.flush();
                     }
-                } else if (stage === "write") {
-                    var result = writePhase(ctx, ui, plan);
-                    finish(result);
+                } else if (stage === "write" && plan.stats.overwrite > 0) {
+                    // confirm() did not show from inside this dialog in Bridge 2026, so replacing ratings takes
+                    // a second click on the relabelled button instead
+                    stage = "confirm";
+                    var notice = replaceNotice(ctx, plan);
+                    ui.log("");
+                    for (var i = 0; i < notice.length; i++) ui.log(notice[i]);
+                    action.text = "Confirm: write " + plan.list.length + ", replace " + plan.stats.overwrite;
+                    action.enabled = true;
+                    cancel.enabled = true;
+                    ui.progress("Confirm: existing ratings will be replaced. Check the list below, then confirm or Cancel.", 0, 0, "");
+                    ui.flush();
+                } else {
+                    setStep(3);
+                    finish(writePhase(ctx, ui, plan));
                 }
             } catch (e) {
                 ui.log("");
                 ui.log("ABORTED: " + e.message + (e.line ? " (line " + e.line + ")" : ""));
-                finish("Aborted: " + e.message);
+                finish({ text: "Aborted: " + e.message, level: "bad" });
             } finally {
                 app.synchronousMode = oldMode;
             }
@@ -240,7 +299,90 @@
             ui.progress("Cancelled. No ratings were written.", 0, 0, "");
             w.close();
         };
+        openLog.onClick = function () { result.logFile.execute(); };
+        openBackup.onClick = function () { result.backupDir.execute(); };
+        showTarget.onClick = function () {
+            w.close();
+            app.document.thumbnail = new Thumbnail(ctx.dstDir);
+        };
+
+        setStep(1);
         return ui;
+    }
+
+    // "Setup > [ Read ] > Review > Write > Done": the current step bracketed; colors where ScriptUI applies them
+    function makeSteps(w) {
+        var names = ["Setup", "Read", "Review", "Write", "Done"];
+        var row = w.add("group");
+        var labels = [];
+        for (var i = 0; i < names.length; i++) {
+            if (i > 0) style(row.add("statictext", undefined, ">"), null, COLORS.dim);
+            var st = row.add("statictext", undefined, "");
+            // Fixed width: Bridge clipped "[ REVIEW ]" when the label was sized from its own bold text
+            st.characters = 12;
+            st.justify = "center";
+            style(st, true, null);
+            labels.push(st);
+        }
+        return function (current) {
+            var last = current === names.length - 1;
+            for (var k = 0; k < labels.length; k++) {
+                labels[k].text = k === current ? "[ " + names[k] + " ]" : names[k];
+                style(labels[k], null, k < current || last ? COLORS.ok : k === current ? COLORS.accent : COLORS.dim);
+            }
+        };
+    }
+
+    // Key counts as large numbers, so they do not have to be found in the log
+    function makeSummary(w) {
+        var panel = w.add("panel", undefined, "Summary");
+        panel.orientation = "row";
+        panel.alignChildren = ["fill", "top"];
+        var defs = [["toWrite", "To write"], ["replace", "Replace a rating"], ["same", "Already equal"],
+            ["skipped", "Skipped"], ["warnings", "Warnings"], ["errors", "Errors"]];
+        var cells = {};
+        for (var i = 0; i < defs.length; i++) {
+            var g = panel.add("group");
+            g.orientation = "column";
+            g.alignChildren = ["center", "top"];
+            var value = g.add("statictext", undefined, "-");
+            value.characters = 9;
+            value.justify = "center";
+            style(value, true, null, 6);
+            var label = g.add("statictext", undefined, defs[i][1]);
+            label.characters = 14;
+            label.justify = "center";
+            cells[defs[i][0]] = { value: value, label: label };
+        }
+        return cells;
+    }
+
+    // Fonts and colors are cosmetic; a ScriptUI quirk here must never stop a run
+    function style(st, bold, rgb, sizeUp) {
+        try {
+            var g = st.graphics;
+            if (bold !== null) g.font = ScriptUI.newFont(g.font.name, bold ? "BOLD" : "REGULAR", g.font.size + (sizeUp || 0));
+            if (rgb) g.foregroundColor = g.newPen(g.PenType.SOLID_COLOR, rgb, 1);
+        } catch (e) {
+            // Keep the default look
+        }
+    }
+
+    // Replacing a rating the target already has is the change most likely to be a mistake, such as swapped folders
+    function replaceNotice(ctx, plan) {
+        var n = plan.stats.overwrite;
+        var examples = [];
+        for (var i = 0; i < plan.list.length && examples.length < 20; i++) {
+            var p = plan.list[i];
+            if (p.before !== 0) examples.push(p.name + ":  " + p.before + " -> " + p.target);
+        }
+        if (n > examples.length) examples.push("... and " + (n - examples.length) + " more");
+        return ["=== Confirm: " + n + (n === 1 ? " existing target rating" : " existing target ratings") + " will be replaced ==="]
+            .concat(examples, [
+                "Source: " + ctx.srcDir.fsName + "  (" + ctx.srcExt + ")",
+                "Target: " + ctx.dstDir.fsName + "  (" + (ctx.dstExt === "*" ? "all files" : ctx.dstExt) + ")",
+                "If source and target are swapped, press Cancel. Nothing has been written yet."
+            ]);
     }
 
     // Pairs files, reads ratings, decides what to write. Returns {list, rows, stats}
@@ -248,7 +390,7 @@
         var s = {
             srcReadError: 0, dupSrc: 0, dupDst: 0, srcOnly: 0, dstOnly: 0, srcOnlyRated: 0,
             same: 0, overwrite: 0, ignoredUnrated: 0, ignoredReject: 0, dstReadError: 0,
-            srcReadMethod: "", fastFallback: 0, dstSidecar: 0, dstBridge: 0
+            srcReadMethod: "", fastFallback: 0, dstSidecar: 0, dstEmbedded: 0, dstBridge: 0
         };
         var rows = [];
         var issues = [];
@@ -257,7 +399,7 @@
 
         ui.log("");
         ui.log("=== Pairing by file name ===");
-        ui.progress("Pairing files by name", 0, 0, "");
+        ui.progress("Read 1/5: pairing files by name", 0, 0, "");
 
         var src = indexByStem(ctx.srcFiles, issues, "Duplicate source name");
         var dst = indexByStem(ctx.dstFiles, issues, "Duplicate target name");
@@ -297,7 +439,7 @@
         // A rated source file with no target counterpart cannot be synced; it is reported, never written
         for (i = 0; i < srcOnly.length; i++) {
             var lone = srcOnly[i];
-            ui.progress("Checking source files without target for ratings", i + 1, srcOnly.length, lone.name);
+            ui.progress("Read 4/5: checking source files without target for ratings", i + 1, srcOnly.length, lone.name);
             var loneRating = "";
             try {
                 loneRating = useFast ? readRatingDirect(lone.file) : readRating(lone.file);
@@ -317,7 +459,7 @@
         for (i = 0; i < pairs.length; i++) {
             var pr = pairs[i];
             var target = pr.rating;
-            ui.progress("Reading target ratings for rated sources", i + 1, pairs.length, pr.name);
+            ui.progress("Read 5/5: reading target ratings", i + 1, pairs.length, pr.name);
 
             if (target === null) {
                 rows.push([pr.name, pr.srcName, "", "", "skip: source rating unreadable"]);
@@ -365,7 +507,7 @@
         ui.log("");
         ui.log("=== Summary ===");
         ui.log("Source read: " + s.srcReadMethod + (s.fastFallback ? " (" + s.fastFallback + " via Bridge fallback)" : ""));
-        ui.log("Target read: sidecar XMP " + s.dstSidecar + ", Bridge " + s.dstBridge);
+        ui.log("Target read: sidecar XMP " + s.dstSidecar + ", embedded RAW XMP " + s.dstEmbedded + ", Bridge " + s.dstBridge);
         ui.log("To write: " + list.length + "  (target already rated, different value: " + s.overwrite + ")");
         ui.log("Already equal: " + s.same);
         ui.log("Ignored (source unrated): " + s.ignoredUnrated);
@@ -376,12 +518,24 @@
         if (list.length > 0) {
             ui.log("");
             ui.log("=== Planned changes (target: before -> source rating) ===");
-            for (i = 0; i < list.length; i++) ui.log(list[i].name + ": " + list[i].before + " -> " + list[i].target);
+            for (i = 0; i < list.length; i++) {
+                ui.log(list[i].name + ": " + list[i].before + " -> " + list[i].target +
+                    (list[i].before !== 0 ? "   (replaces existing rating)" : ""));
+            }
         }
         ui.log("");
         ui.log("Nothing has been written yet.");
 
-        return { list: list, rows: rows, stats: s };
+        var readErrors = s.srcReadError + s.dstReadError;
+        ui.cell("toWrite", list.length);
+        ui.cell("replace", s.overwrite, s.overwrite ? "warn" : null);
+        ui.cell("same", s.same);
+        // Unrated sources get no CSV row, so they are added to the skipped rows here
+        ui.cell("skipped", rows.length + s.ignoredUnrated);
+        ui.cell("warnings", issues.length, issues.length ? "warn" : null);
+        ui.cell("errors", readErrors, readErrors ? "bad" : null);
+
+        return { list: list, rows: rows, stats: s, warnings: issues.length };
     }
 
     function indexByStem(files, issues, dupLabel) {
@@ -399,36 +553,51 @@
         return idx;
     }
 
-    // Returns the final status line
+    // Returns {text, level, logFile, backupDir} for the final screen
     function writePhase(ctx, ui, plan) {
-        var rows = plan.rows;
+        var n = plan.list.length;
         var stamp = timestamp();
         var backupDir = null;
-        if (CONFIG.BACKUP_XMP) {
+        if (CONFIG.BACKUP_XMP || CONFIG.BACKUP_EMBEDDED) {
             backupDir = new Folder(ctx.dstDir.fsName + "/_rating_sync_backup_" + stamp);
             if (!backupDir.create()) throw new Error("Cannot create backup folder " + backupDir.fsName);
         }
 
-        var written = 0, writeError = 0, noSidecar = 0;
+        // Every planned change and its before value is on disk before the first write, so a crash mid-write
+        // still leaves enough to restore ratings. Results are appended as they happen; the file is rewritten at the end.
+        var header = ["target", "source", "target_before", "source_rating", "result"];
+        var logFile = new File(ctx.dstDir.fsName + "/_rating_sync_log_" + stamp + ".csv");
+        var results = [];
+        if (!writeCsv(logFile, header, plan.rows.concat(planRows(plan.list, results, "pending: not written yet")))) {
+            if (backupDir) backupDir.remove();
+            throw new Error("Cannot write log " + logFile.fsName + ". Nothing was written.");
+        }
+
+        var written = 0, writeError = 0, noSidecar = 0, backedUp = 0;
         var aborted = false;
 
         ui.log("");
         ui.log("=== Writing ===");
-        for (var i = 0; i < plan.list.length; i++) {
+        ui.cell("toWrite", "0 / " + n, null, "Written");
+        for (var i = 0; i < n; i++) {
             var p = plan.list[i];
             var r;
-            ui.progress("Writing target ratings", i + 1, plan.list.length, p.name);
+            ui.progress("Write: writing target ratings", i + 1, n, p.name);
             try {
                 r = writeOne(p, backupDir);
             } catch (e) {
                 r = { kind: "error", status: "error: " + e.message };
             }
-            rows.push([p.name, p.srcName, p.before, p.target, r.status]);
+            results.push(r.status);
+            appendCsv(logFile, [p.name, p.srcName, p.before, p.target, r.status]);
             ui.log(p.name + ": " + p.before + " -> " + p.target + "   " + r.status);
 
             if (r.kind === "ok" || r.kind === "warn") written++;
             if (r.kind === "warn") noSidecar++;
-            if (r.kind === "error") writeError++;
+            if (r.backedUp) backedUp++;
+            if (r.kind === "error" || r.kind === "fatal") writeError++;
+            ui.cell("toWrite", written + " / " + n);
+            if (writeError) ui.cell("errors", plan.stats.srcReadError + plan.stats.dstReadError + writeError, "bad");
             if (r.kind === "fatal") {
                 aborted = true;
                 break;
@@ -436,30 +605,51 @@
         }
 
         if (backupDir && backupDir.getFiles().length === 0) backupDir.remove();
-
-        var logFile = new File(ctx.dstDir.fsName + "/_rating_sync_log_" + stamp + ".csv");
-        var logOk = writeCsv(logFile, ["target", "source", "target_before", "source_rating", "result"], rows);
+        var logOk = writeCsv(logFile, header, plan.rows.concat(planRows(plan.list, results, "not processed: run stopped")));
 
         ui.log("");
         ui.log("=== Result ===");
         if (aborted) ui.log("STOPPED: a target file itself changed on write. Remaining files were not processed.");
-        ui.log("Written: " + written + " / " + plan.list.length);
-        ui.log("Write errors: " + writeError);
-        ui.log("Written, metadata embedded or no XMP sidecar: " + noSidecar);
-        ui.log("Log: " + (logOk ? logFile.fsName : "could not be written"));
-        if (backupDir && backupDir.exists) ui.log("XMP backup: " + backupDir.fsName);
+        ui.log("Written and read back: " + written + " / " + n);
+        ui.log("Errors (write, backup, read-back mismatch): " + writeError);
+        ui.log("Written, metadata embedded or no XMP sidecar: " + noSidecar + "  (original backed up: " + backedUp + ")");
+        ui.log("Log: " + logFile.fsName + (logOk ? "" : "  (final rewrite failed; results are appended at the end)"));
+        if (backupDir && backupDir.exists) ui.log("Backup: " + backupDir.fsName);
 
-        return (aborted ? "Stopped" : "Finished") + ": written " + written + " / " + plan.list.length +
-            ", errors " + writeError;
+        return {
+            text: (aborted ? "Stopped" : "Finished") + ": written " + written + " / " + n + ", errors " + writeError,
+            level: aborted ? "bad" : writeError ? "warn" : "ok",
+            logFile: logFile,
+            backupDir: backupDir && backupDir.exists ? backupDir : null
+        };
     }
 
-    // Targets that embed XMP (JPG, DNG, TIFF) legitimately change on write; RAW files with sidecars must not
+    // One CSV row per planned change; results[i] once processed, otherwise the fallback status
+    function planRows(list, results, fallback) {
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var p = list[i];
+            out.push([p.name, p.srcName, p.before, p.target, i < results.length ? results[i] : fallback]);
+        }
+        return out;
+    }
+
+    // Targets that embed XMP (JPG, DNG, TIFF) legitimately change on write; RAW files and files with sidecars must not
     function writeOne(p, backupDir) {
         var xmp = sidecarOf(p.file);
         var hadXmp = xmp.exists;
+        var isRaw = RAW_EXTS.hasOwnProperty(extOf(p.name));
 
-        if (hadXmp && backupDir && !xmp.copy(backupDir.fsName + "/" + decodedName(xmp))) {
+        if (hadXmp && backupDir && CONFIG.BACKUP_XMP && !xmp.copy(backupDir.fsName + "/" + decodedName(xmp))) {
             return { kind: "error", status: "skip: XMP backup failed, rating not written" };
+        }
+        // Without a sidecar Bridge rewrites the XMP inside a non-RAW file, so the whole file is copied first
+        var fileCopy = null;
+        if (!hadXmp && !isRaw && backupDir && CONFIG.BACKUP_EMBEDDED) {
+            fileCopy = new File(backupDir.fsName + "/" + p.name);
+            if (!p.file.copy(fileCopy.fsName)) {
+                return { kind: "error", status: "skip: file backup failed, rating not written" };
+            }
         }
 
         var sizeBefore = p.file.length;
@@ -472,13 +662,38 @@
         if (fileChanged && hadXmp) {
             return { kind: "fatal", status: "ABORT: target file itself changed although it had an XMP sidecar" };
         }
+        if (fileChanged && isRaw) {
+            return { kind: "fatal", status: "ABORT: RAW target file itself changed" };
+        }
+        if (fileCopy && !fileChanged) fileCopy.remove();
+
+        var stored = readBack(p.file);
+        if (stored !== p.target) {
+            return { kind: "error", status: "error: read back " + stored + " instead of " + p.target };
+        }
         if (fileChanged) {
-            return { kind: "warn", status: "written: metadata embedded in the file" };
+            return { kind: "warn", backedUp: !!fileCopy,
+                status: "written: metadata embedded in the file" + (fileCopy ? ", original backed up" : "") };
         }
         if (!sidecarOf(p.file).exists) {
             return { kind: "warn", status: "written: no XMP sidecar found" };
         }
         return { kind: "ok", status: hadXmp ? "written: XMP updated" : "written: XMP created" };
+    }
+
+    // Reads the written value from disk rather than through Bridge, which may answer from its own cache.
+    // Bridge clears a rating by removing xmp:Rating, so a sidecar without one reads as 0 instead of
+    // falling through to the rating the camera embedded in the file.
+    function readBack(file) {
+        try {
+            if (!loadXmpLib()) return readRating(file);
+            var side = sidecarOf(file);
+            if (!side.exists) return embeddedRating(file);
+            var r = ratingFromXmp(new XMPMeta(readText(side)), file);
+            return r === null ? 0 : r;
+        } catch (e) {
+            return "unreadable (" + e.message + ")";
+        }
     }
 
     // Excludes macOS "._" AppleDouble files, which exFAT/FAT cards accumulate with the same extensions
@@ -525,8 +740,9 @@
         return r;
     }
 
-    // Target ratings in a .xmp sidecar are read from it directly; Bridge is asked when there is no
-    // sidecar, the sidecar has no xmp:Rating, or the sidecar cannot be parsed
+    // Target ratings in a .xmp sidecar are read from it directly. A RAW file without a sidecar has never been rated
+    // in Bridge, so the XMP the camera embedded is what Bridge shows and is read directly too. Bridge is asked for
+    // other files without a sidecar, a sidecar with no xmp:Rating, or when a direct read fails.
     function readDstRating(file, s, notes) {
         var side = sidecarOf(file);
         if (side.exists && loadXmpLib()) {
@@ -539,6 +755,14 @@
                 notes.push(decodedName(file) + ": sidecar has no xmp:Rating");
             } catch (e) {
                 notes.push(decodedName(file) + ": sidecar unreadable (" + e.message + ")");
+            }
+        } else if (!side.exists && RAW_EXTS.hasOwnProperty(extOf(decodedName(file))) && loadXmpLib()) {
+            try {
+                var embedded = embeddedRating(file);
+                s.dstEmbedded++;
+                return embedded;
+            } catch (e) {
+                notes.push(decodedName(file) + ": embedded XMP unreadable (" + e.message + ")");
             }
         }
         s.dstBridge++;
@@ -570,7 +794,7 @@
 
     function readAllSrc(pairs, useFast, notes, ui, s) {
         var errors = [];
-        var phase = "Reading source ratings (" + (useFast ? "direct XMP" : "Bridge") + ")";
+        var phase = "Read 2/5: reading source ratings (" + (useFast ? "direct XMP" : "Bridge") + ")";
         for (var i = 0; i < pairs.length; i++) {
             var pr = pairs[i];
             ui.progress(phase, i + 1, pairs.length, pr.srcName);
@@ -598,7 +822,7 @@
         var checked = 0;
         for (var k = 0; k < n; k++) {
             var pr = pairs[Math.floor(k * pairs.length / n)];
-            ui.progress("Checking direct read against Bridge", k + 1, n, pr.srcName);
+            ui.progress("Read 3/5: checking direct read against Bridge", k + 1, n, pr.srcName);
             if (pr.rating === null) continue;
             var viaBridge;
             try {
@@ -633,6 +857,11 @@
             var fromSidecar = ratingFromXmp(new XMPMeta(readText(side)), file);
             if (fromSidecar !== null) return fromSidecar;
         }
+        return embeddedRating(file);
+    }
+
+    // Rating in the XMP packet inside the file; 0 when the packet has none
+    function embeddedRating(file) {
         var xf = new XMPFile(file.fsName, XMPConst.UNKNOWN, XMPConst.OPEN_FOR_READ | XMPConst.OPEN_ONLY_XMP);
         try {
             var embedded = ratingFromXmp(xf.getXMP(), file);
@@ -662,7 +891,7 @@
         var started = formatTime(new Date());
         var lastWrite = 0;
         var lastPhase = "";
-        return function (phase, done, total, current) {
+        return function (phase, done, total, current, speed) {
             var now = new Date().getTime();
             if (phase === lastPhase && done !== total && now - lastWrite < 1000) return;
             lastWrite = now;
@@ -670,6 +899,7 @@
 
             var lines = ["Phase: " + phase];
             if (total) lines.push("Progress: " + done + " / " + total + " (" + Math.floor(done * 100 / total) + "%)");
+            if (speed) lines.push("Speed: " + speed);
             if (current) lines.push("Current: " + current);
             lines.push("Source: " + ctx.srcDir.fsName + "  " + ctx.srcExt,
                 "Target: " + ctx.dstDir.fsName + "  " + ctx.dstExt,
@@ -678,7 +908,7 @@
                 file.encoding = "UTF-8";
                 if (file.open("w")) {
                     // BOM so Notepad and Windows PowerShell decode non-ASCII paths correctly
-                    file.write("FEFF" + lines.join("\n") + "\n");
+                    file.write("\uFEFF" + lines.join("\n") + "\n");
                     file.close();
                 }
             } catch (e) {
@@ -693,6 +923,20 @@
             p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
     }
 
+    // "25 files/s, about 1 min 10 s left, 48 s elapsed"; empty until two seconds of a phase give a usable rate
+    function speedText(done, total, ms) {
+        if (!total || done === 0 || ms < 2000) return "";
+        var rate = done * 1000 / ms;
+        var text = (rate >= 10 ? Math.round(rate) : rate.toFixed(1)) + " files/s";
+        if (done < total) text += ", about " + duration((total - done) / rate) + " left";
+        return text + ", " + duration(ms / 1000) + " elapsed";
+    }
+
+    function duration(sec) {
+        sec = Math.round(sec);
+        return sec < 60 ? sec + " s" : Math.floor(sec / 60) + " min " + (sec % 60) + " s";
+    }
+
     function timestamp() {
         var d = new Date();
         function p(n) { return (n < 10 ? "0" : "") + n; }
@@ -705,21 +949,36 @@
         return /[",\r\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
     }
 
+    function csvLine(row) {
+        var cells = [];
+        for (var j = 0; j < row.length; j++) cells.push(csvCell(row[j]));
+        return cells.join(",");
+    }
+
     function writeCsv(file, header, rows) {
         file.encoding = "UTF-8";
         if (!file.open("w")) return false;
         try {
             // BOM so Excel reads non-ASCII file names correctly
-            file.write("FEFF");
+            file.write("\uFEFF");
             var all = [header].concat(rows);
-            for (var i = 0; i < all.length; i++) {
-                var cells = [];
-                for (var j = 0; j < all[i].length; j++) cells.push(csvCell(all[i][j]));
-                file.writeln(cells.join(","));
-            }
+            for (var i = 0; i < all.length; i++) file.writeln(csvLine(all[i]));
         } finally {
             file.close();
         }
         return true;
+    }
+
+    // A failed append is tolerated: the log written before the run already holds the before value
+    function appendCsv(file, row) {
+        try {
+            file.encoding = "UTF-8";
+            if (file.open("a")) {
+                file.writeln(csvLine(row));
+                file.close();
+            }
+        } catch (e) {
+            // Keep writing ratings; the final rewrite records this result again
+        }
     }
 })();
