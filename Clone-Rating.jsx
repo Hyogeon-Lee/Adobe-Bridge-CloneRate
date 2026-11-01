@@ -13,6 +13,9 @@
         BACKUP_XMP: true,
         // Copies a target whose XMP is embedded (JPG, TIFF, DNG) before Bridge rewrites it; kept only if the file changed
         BACKUP_EMBEDDED: true,
+        // A rated source file with no target counterpart is copied into a subfolder of the target folder,
+        // such as "JPG_only_rated"; existing files there are never replaced
+        COPY_SRC_ONLY: true,
         FAST_READ: true,
         FAST_READ_CHECK: 100,
         PROGRESS_FILE: true
@@ -335,12 +338,12 @@
             try {
                 if (stage === "read") {
                     plan = readPhase(ctx, ui);
-                    if (plan.list.length === 0) {
+                    if (plan.list.length === 0 && plan.copies.length === 0) {
                         finish({ text: "Finished: nothing to write. No files were changed.", level: plan.warnings ? "warn" : "ok" });
                     } else {
                         stage = "write";
                         setStep(2);
-                        action.text = "Write " + plan.list.length + " file" + (plan.list.length === 1 ? "" : "s");
+                        action.text = writeLabel(plan);
                         action.enabled = true;
                         cancel.enabled = true;
                         ui.progress("Review: check the summary and planned changes, then press Write or Cancel.", 0, 0, "");
@@ -353,7 +356,8 @@
                     var notice = replaceNotice(ctx, plan);
                     ui.log("");
                     for (var i = 0; i < notice.length; i++) ui.log(notice[i]);
-                    action.text = "Confirm: write " + plan.list.length + ", replace " + plan.stats.overwrite;
+                    action.text = "Confirm: write " + plan.list.length + ", replace " + plan.stats.overwrite +
+                        (plan.copies.length ? ", copy " + plan.copies.length : "");
                     action.enabled = true;
                     cancel.enabled = true;
                     ui.progress("Confirm: existing ratings will be replaced. Check the list below, then confirm or Cancel.", 0, 0, "");
@@ -385,6 +389,12 @@
         return ui;
     }
 
+    // "Write 3 files", "Copy 2 files", "Write 3, copy 2 files"
+    function writeLabel(plan) {
+        var n = plan.list.length, m = plan.copies.length;
+        return (n ? "Write " + n + (m ? ", copy " + m : "") : "Copy " + m) + (n + m === 1 ? " file" : " files");
+    }
+
     // "Setup > [ Read ] > Review > Write > Done": the current step bracketed; colors where ScriptUI applies them
     function makeSteps(w) {
         var names = ["Setup", "Read", "Review", "Write", "Done"];
@@ -413,7 +423,7 @@
         var panel = w.add("panel", undefined, "Summary");
         panel.orientation = "row";
         panel.alignChildren = ["fill", "top"];
-        var defs = [["toWrite", "To write"], ["replace", "Replace a rating"], ["same", "Already equal"],
+        var defs = [["toWrite", "To write"], ["toCopy", "To copy"], ["replace", "Replace a rating"], ["same", "Already equal"],
             ["skipped", "Skipped"], ["warnings", "Warnings"], ["errors", "Errors"]];
         var cells = {};
         for (var i = 0; i < defs.length; i++) {
@@ -460,7 +470,7 @@
             ]);
     }
 
-    // Pairs files, reads ratings, decides what to write. Returns {list, rows, stats}
+    // Pairs files, reads ratings, decides what to write and copy. Returns {list, copies, copyDirName, rows, stats, warnings}
     function readPhase(ctx, ui) {
         var s = {
             srcReadError: 0, dupSrc: 0, dupDst: 0, srcOnly: 0, dstOnly: 0, srcOnlyRated: 0,
@@ -511,7 +521,10 @@
         if (CONFIG.FAST_READ && !ctx.sameFolder && !useFast) notes.push("AdobeXMPScript library not available; all files read through Bridge");
         readSrcRatings(pairs, useFast, issues, notes, ui, s);
 
-        // A rated source file with no target counterpart cannot be synced; it is reported, never written
+        // A rated source file with no target counterpart cannot be synced. With COPY_SRC_ONLY it is planned as a copy
+        // into a subfolder of the target folder, otherwise it is only reported.
+        var copies = [];
+        var copyDirName = ctx.srcExt.substring(1).toUpperCase() + "_only_rated";
         for (i = 0; i < srcOnly.length; i++) {
             var lone = srcOnly[i];
             ui.progress("Read 4/5: checking source files without target for ratings", i + 1, srcOnly.length, lone.name);
@@ -525,6 +538,11 @@
                 issues.push("Source without target, rating unreadable: " + lone.name);
             } else if (loneRating > 0) {
                 s.srcOnlyRated++;
+                if (CONFIG.COPY_SRC_ONLY) {
+                    copies.push({ file: lone.file, name: copyDirName + "\\" + lone.name, srcName: lone.name,
+                        before: "", target: loneRating });
+                    continue;
+                }
                 issues.push("Rated source (" + loneRating + ") has no target file: " + lone.name);
             }
             rows.push(["", lone.name, "", loneRating, "skip: no target file"]);
@@ -584,6 +602,7 @@
         ui.log("Source read: " + s.srcReadMethod + (s.fastFallback ? " (" + s.fastFallback + " via Bridge fallback)" : ""));
         ui.log("Target read: sidecar XMP " + s.dstSidecar + ", embedded RAW XMP " + s.dstEmbedded + ", Bridge " + s.dstBridge);
         ui.log("To write: " + list.length + "  (target already rated, different value: " + s.overwrite + ")");
+        if (CONFIG.COPY_SRC_ONLY) ui.log("To copy into " + copyDirName + ": " + copies.length + "  (rated source without target)");
         ui.log("Already equal: " + s.same);
         ui.log("Ignored (source unrated): " + s.ignoredUnrated);
         ui.log("Ignored (source rejected): " + s.ignoredReject);
@@ -598,11 +617,17 @@
                     (list[i].before !== 0 ? "   (replaces existing rating)" : ""));
             }
         }
+        if (copies.length > 0) {
+            ui.log("");
+            ui.log("=== Planned copies (rated source without target -> " + ctx.dstDir.fsName + "\\" + copyDirName + ") ===");
+            for (i = 0; i < copies.length; i++) ui.log(copies[i].srcName + ": rating " + copies[i].target);
+        }
         ui.log("");
         ui.log("Nothing has been written yet.");
 
         var readErrors = s.srcReadError + s.dstReadError;
         ui.cell("toWrite", list.length);
+        ui.cell("toCopy", copies.length);
         ui.cell("replace", s.overwrite, s.overwrite ? "warn" : null);
         ui.cell("same", s.same);
         // Unrated sources get no CSV row, so they are added to the skipped rows here
@@ -610,7 +635,7 @@
         ui.cell("warnings", issues.length, issues.length ? "warn" : null);
         ui.cell("errors", readErrors, readErrors ? "bad" : null);
 
-        return { list: list, rows: rows, stats: s, warnings: issues.length };
+        return { list: list, copies: copies, copyDirName: copyDirName, rows: rows, stats: s, warnings: issues.length };
     }
 
     function indexByStem(files, issues, dupLabel) {
@@ -631,11 +656,17 @@
     // Returns {text, level, logFile, backupDir} for the final screen
     function writePhase(ctx, ui, plan) {
         var n = plan.list.length;
+        var m = plan.copies.length;
         var stamp = timestamp();
         var backupDir = null;
         if (CONFIG.BACKUP_XMP || CONFIG.BACKUP_EMBEDDED) {
             backupDir = new Folder(ctx.dstDir.fsName + "/_rating_sync_backup_" + stamp);
             if (!backupDir.create()) throw new Error("Cannot create backup folder " + backupDir.fsName);
+        }
+        var copyDir = m ? new Folder(ctx.dstDir.fsName + "/" + plan.copyDirName) : null;
+        if (copyDir && !copyDir.exists && !copyDir.create()) {
+            if (backupDir) backupDir.remove();
+            throw new Error("Cannot create folder " + copyDir.fsName + ". Nothing was written.");
         }
 
         // Every planned change and its before value is on disk before the first write, so a crash mid-write
@@ -643,8 +674,14 @@
         var header = ["target", "source", "target_before", "source_rating", "result"];
         var logFile = new File(ctx.dstDir.fsName + "/_rating_sync_log_" + stamp + ".csv");
         var results = [];
-        if (!writeCsv(logFile, header, plan.rows.concat(planRows(plan.list, results, "pending: not written yet")))) {
+        var copyResults = [];
+        function logRows(fallback) {
+            return plan.rows.concat(planRows(plan.list, results, fallback), planRows(plan.copies, copyResults, fallback));
+        }
+        if (!writeCsv(logFile, header, logRows("pending: not written yet"))) {
+            // Folder.remove() deletes only empty folders, so a copy folder left by an earlier run stays
             if (backupDir) backupDir.remove();
+            if (copyDir) copyDir.remove();
             throw new Error("Cannot write log " + logFile.fsName + ". Nothing was written.");
         }
 
@@ -679,8 +716,32 @@
             }
         }
 
+        var copied = 0, copyError = 0;
+        if (m && !aborted) {
+            ui.log("");
+            ui.log("=== Copying rated source files without target ===");
+            ui.cell("toCopy", "0 / " + m, null, "Copied");
+            for (var j = 0; j < m; j++) {
+                var c = plan.copies[j];
+                ui.progress("Write: copying rated source files into " + plan.copyDirName, j + 1, m, c.srcName);
+                try {
+                    r = copyOne(c, copyDir);
+                } catch (e) {
+                    r = { kind: "error", status: "error: " + e.message };
+                }
+                copyResults.push(r.status);
+                appendCsv(logFile, [c.name, c.srcName, c.before, c.target, r.status]);
+                ui.log(c.srcName + " (" + c.target + ") -> " + c.name + "   " + r.status);
+                if (r.kind === "ok") copied++;
+                if (r.kind === "error") copyError++;
+                ui.cell("toCopy", copied + " / " + m);
+                if (copyError) ui.cell("errors", plan.stats.srcReadError + plan.stats.dstReadError + writeError + copyError, "bad");
+            }
+        }
+
         if (backupDir && backupDir.getFiles().length === 0) backupDir.remove();
-        var logOk = writeCsv(logFile, header, plan.rows.concat(planRows(plan.list, results, "not processed: run stopped")));
+        if (copyDir && copyDir.getFiles().length === 0) copyDir.remove();
+        var logOk = writeCsv(logFile, header, logRows("not processed: run stopped"));
 
         ui.log("");
         ui.log("=== Result ===");
@@ -688,12 +749,19 @@
         ui.log("Written and read back: " + written + " / " + n);
         ui.log("Errors (write, backup, read-back mismatch): " + writeError);
         ui.log("Written, metadata embedded or no XMP sidecar: " + noSidecar + "  (original backed up: " + backedUp + ")");
+        if (m) {
+            ui.log("Copied into " + copyDir.fsName + ": " + copied + " / " + m + "  (already there: " +
+                (copyResults.length - copied - copyError) + ", errors: " + copyError + ")");
+        }
         ui.log("Log: " + logFile.fsName + (logOk ? "" : "  (final rewrite failed; results are appended at the end)"));
         if (backupDir && backupDir.exists) ui.log("Backup: " + backupDir.fsName);
 
+        var counts = [];
+        if (n) counts.push("written " + written + " / " + n);
+        if (m) counts.push("copied " + copied + " / " + m);
         return {
-            text: (aborted ? "Stopped" : "Finished") + ": written " + written + " / " + n + ", errors " + writeError,
-            level: aborted ? "bad" : writeError ? "warn" : "ok",
+            text: (aborted ? "Stopped" : "Finished") + ": " + counts.join(", ") + ", errors " + (writeError + copyError),
+            level: aborted ? "bad" : writeError + copyError ? "warn" : "ok",
             logFile: logFile,
             backupDir: backupDir && backupDir.exists ? backupDir : null
         };
@@ -754,6 +822,29 @@
             return { kind: "warn", status: "written: no XMP sidecar found" };
         }
         return { kind: "ok", status: hadXmp ? "written: XMP updated" : "written: XMP created" };
+    }
+
+    // Copies a rated source file that has no target into copyDir. A file already there is never replaced, and the
+    // source's .xmp sidecar goes along so the copy keeps its rating.
+    function copyOne(c, copyDir) {
+        var where = decodedName(copyDir);
+        var dest = new File(copyDir.fsName + "/" + c.srcName);
+        if (dest.exists) return { kind: "skip", status: "skip: already in " + where };
+        if (!c.file.copy(dest.fsName)) return { kind: "error", status: "error: copy failed" };
+        if (new File(dest.fsName).length !== c.file.length) {
+            dest.remove();
+            return { kind: "error", status: "error: copy incomplete, removed" };
+        }
+        var side = sidecarOf(c.file);
+        if (!side.exists) return { kind: "ok", status: "copied to " + where };
+        var destSide = sidecarOf(dest);
+        // Without its sidecar the copy may lack the rating, so it is removed and the next run tries again
+        if (destSide.exists || !side.copy(destSide.fsName)) {
+            dest.remove();
+            return { kind: "error", status: "error: XMP sidecar not copied" +
+                (destSide.exists ? " (" + decodedName(destSide) + " already in " + where + ")" : "") + ", copy removed" };
+        }
+        return { kind: "ok", status: "copied to " + where + " with XMP sidecar" };
     }
 
     // Reads the written value from disk rather than through Bridge, which may answer from its own cache.
